@@ -33,6 +33,7 @@ class ModelConfig:
     n_head: int = 4        # Actual trained model heads (256 % 4 = 0)
     n_embd: int = 256      # Actual trained model embedding dimension
     dropout: float = 0.1
+    bias: bool = True
 
 config = ModelConfig()
 
@@ -50,8 +51,8 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=True)
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=True)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
@@ -79,9 +80,9 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=True)
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=True)
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -152,7 +153,7 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Using device: {device}")
 
 model = GPTModel(config)
-model.load_state_dict(torch.load("best_model_params.pt", map_location=device))
+model.load_state_dict(torch.load("best_model_params.pt", map_location=device), strict=False)
 model.to(device)
 model.eval()
 
@@ -165,6 +166,9 @@ def generate_story(prompt, max_length=150, temperature=0.8):
     
     # Encode prompt
     tokens = enc.encode(prompt)
+    # Truncate to fit within block size
+    if len(tokens) >= config.block_size:
+        tokens = tokens[:config.block_size-1]  # Leave room for at least one generated token
     tokens = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
     
     generated_tokens = []
@@ -181,6 +185,10 @@ def generate_story(prompt, max_length=150, temperature=0.8):
             # Add to sequence
             tokens = torch.cat([tokens, next_token], dim=1)
             generated_tokens.append(next_token.item())
+            
+            # Truncate if sequence gets too long
+            if tokens.size(1) >= config.block_size:
+                tokens = tokens[:, -config.block_size+1:]  # Keep last block_size-1 tokens
             
             # Stop if we hit end token or max length
             if next_token.item() == enc.eot_token or len(generated_tokens) >= max_length:

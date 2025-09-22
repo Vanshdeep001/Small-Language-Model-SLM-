@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Interactive Story Chat - Type prompts and get story continuations
+Command Line Story Generator
+Generate stories using your trained Small Language Model
 """
 
 import torch
@@ -8,11 +9,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 import tiktoken
 import os
-import numpy as np
 import math
+import numpy as np
+import argparse
 from dataclasses import dataclass
 
-# Model configuration (matching the actual trained model)
+# Check if model exists
+if not os.path.exists("best_model_params.pt"):
+    print("❌ Model file 'best_model_params.pt' not found!")
+    print("Please run training first.")
+    exit(1)
+
+print("✅ Loading your trained SLM for story generation...")
+
+# Load tokenizer
+enc = tiktoken.get_encoding("gpt2")
+
+# Model configuration (matching the training script)
 @dataclass
 class ModelConfig:
     block_size: int = 64   # Actual trained model block size
@@ -23,7 +36,9 @@ class ModelConfig:
     dropout: float = 0.1
     bias: bool = True
 
-# Model architecture
+config = ModelConfig()
+
+# Model architecture (matching the training script)
 class LayerNorm(nn.Module):
     def __init__(self, ndim, bias):
         super().__init__()
@@ -81,9 +96,9 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.ln1 = LayerNorm(config.n_embd, bias=True)
+        self.ln1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
-        self.ln2 = LayerNorm(config.n_embd, bias=True)
+        self.ln2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
     def forward(self, x):
@@ -103,18 +118,29 @@ class GPTModel(nn.Module):
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=True),
+            ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight
 
+        # init all weights
+        self.apply(self._init_weights)
+        # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def forward(self, idx, targets=None):
         device = idx.device
-        b, t = idx.shape
+        b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device)
 
@@ -134,53 +160,32 @@ class GPTModel(nn.Module):
 
         return logits, loss
 
-def load_model_info():
-    """Load model and data info"""
-    if not os.path.exists("best_model_params.pt"):
-        print("❌ Model file 'best_model_params.pt' not found!")
-        return False, None, None, None
-    
-    print("✅ Loading neural network model...")
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
-    
-    # Load tokenizer
-    enc = tiktoken.get_encoding("gpt2")
-    
-    # Load model
-    config = ModelConfig()
-    model = GPTModel(config)
-    
-    # Load state dict with strict=False to handle missing bias buffers
-    state_dict = torch.load("best_model_params.pt", map_location=device)
-    model.load_state_dict(state_dict, strict=False)
-    model.to(device)
-    model.eval()
-    
-    print("✅ Neural network model loaded successfully!")
-    return True, enc, model, device
+# Initialize model
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"Using device: {device}")
 
-def generate_story_continuation(prompt, enc, model, device, max_length=200, temperature=0.8):
-    """Generate a story continuation using the neural network model"""
-    print("🤖 Generating story with neural network...")
+model = GPTModel(config)
+model.load_state_dict(torch.load("best_model_params.pt", map_location=device), strict=False)
+model.to(device)
+model.eval()
+
+print("✅ Model loaded successfully!")
+
+def generate_story(prompt, max_length=150, temperature=0.8):
+    """Generate a story from a prompt"""
+    print(f"\n📝 Generating story from: '{prompt}'")
+    print("=" * 60)
     
-    # Encode prompt and truncate if too long
+    # Encode prompt
     tokens = enc.encode(prompt)
-    if len(tokens) > 50:  # Leave room for generation (block_size is 64)
-        tokens = tokens[:50]
-        prompt = enc.decode(tokens)  # Update prompt to match truncated tokens
-        print(f"⚠️  Prompt truncated to fit context window: '{prompt}'")
-    
+    # Truncate to fit within block size
+    if len(tokens) >= config.block_size:
+        tokens = tokens[:config.block_size-1]  # Leave room for at least one generated token
     tokens = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
     
     generated_tokens = []
     with torch.no_grad():
         for i in range(max_length):
-            # Check if we're at the context limit
-            if tokens.shape[1] >= 64:  # block_size is 64
-                # Truncate from the beginning to make room
-                tokens = tokens[:, -63:]
-            
             # Get predictions
             logits, _ = model(tokens)
             logits = logits[:, -1, :] / temperature
@@ -193,113 +198,44 @@ def generate_story_continuation(prompt, enc, model, device, max_length=200, temp
             tokens = torch.cat([tokens, next_token], dim=1)
             generated_tokens.append(next_token.item())
             
+            # Truncate if sequence gets too long
+            if tokens.size(1) >= config.block_size:
+                tokens = tokens[:, -config.block_size+1:]  # Keep last block_size-1 tokens
+            
             # Stop if we hit end token or max length
             if next_token.item() == enc.eot_token or len(generated_tokens) >= max_length:
                 break
     
     # Decode generated text
     full_text = enc.decode(tokens[0].tolist())
-    
-    # Extract just the continuation part (remove the original prompt)
-    continuation = full_text[len(prompt):].strip()
-    
-    # Clean up the text - try to end at a good sentence boundary
-    sentences = continuation.split('.')
-    if len(sentences) > 3:
-        # Take first 3-4 sentences for a good length
-        clean_continuation = '. '.join(sentences[:4]) + '.'
-    else:
-        clean_continuation = continuation
-    
-    return clean_continuation
+    return full_text
 
-def show_welcome():
-    """Show welcome message and instructions"""
-    print("=" * 60)
-    print("📚 INTERACTIVE STORY GENERATOR")
-    print("=" * 60)
-    print("Welcome! Your trained neural network SLM is ready to generate longer stories!")
-    print()
-    print("💡 How to use:")
-    print("• Type a story beginning (like 'Once upon a time...')")
-    print("• Press Enter to get a detailed story continuation")
-    print("• Type 'quit' to exit")
-    print("• Type 'help' for more examples")
-    print()
-    print("🎯 Your model learned from TinyStories (child-friendly content)")
-    print("🚀 Now using neural network for longer, more detailed stories!")
-    print("=" * 60)
-
-def show_help():
-    """Show help and examples"""
-    print("\n📖 STORY PROMPT EXAMPLES:")
-    print("-" * 30)
-    examples = [
-        "Once upon a time there was a little girl",
-        "A brave knight went on an adventure",
-        "The cat sat on the mat and",
-        "One day, a small mouse",
-        "In a magical forest lived",
-        "The princess was very sad because",
-        "A little boy found a mysterious",
-        "The magic wand could",
-        "A little bird wanted to",
-        "The old wizard had"
-    ]
+def main():
+    parser = argparse.ArgumentParser(description='Generate stories using your trained SLM')
+    parser.add_argument('prompt', help='Story prompt (e.g., "Once upon a time")')
+    parser.add_argument('--length', '-l', type=int, default=150, help='Maximum story length (default: 150)')
+    parser.add_argument('--temperature', '-t', type=float, default=0.8, help='Creativity temperature 0.1-1.0 (default: 0.8)')
+    parser.add_argument('--output', '-o', help='Save story to file')
     
-    for i, example in enumerate(examples, 1):
-        print(f"{i:2d}. {example}")
+    args = parser.parse_args()
     
-    print("\n💡 Tips:")
-    print("• Start with 'Once upon a time...' for fairy tales")
-    print("• Use 'A little girl/boy...' for character stories")
-    print("• Try 'The cat/dog...' for animal stories")
-    print("• Use 'One day...' for adventure stories")
-
-def interactive_chat():
-    """Main interactive chat loop"""
-    # Load model
-    success, enc, model, device = load_model_info()
-    if not success:
-        return
+    # Generate story
+    story = generate_story(args.prompt, args.length, args.temperature)
     
-    show_welcome()
+    print(f"\n📖 Generated Story:")
+    print("-" * 60)
+    print(story)
+    print("-" * 60)
     
-    while True:
-        try:
-            # Get user input
-            prompt = input("\n📝 Your story beginning: ").strip()
-            
-            # Handle special commands
-            if prompt.lower() == 'quit':
-                print("\n👋 Thanks for using your SLM! Happy storytelling!")
-                break
-            elif prompt.lower() == 'help':
-                show_help()
-                continue
-            elif not prompt:
-                print("Please enter a story beginning!")
-                continue
-            
-            # Generate story continuation
-            print(f"\n🎯 Your prompt: '{prompt}'")
-            print("🤖 Story continuation:")
-            print("-" * 40)
-            
-            continuation = generate_story_continuation(prompt, enc, model, device, max_length=150, temperature=0.8)
-            print(continuation)
-            print("-" * 40)
-            
-            print("\n✨ Want to continue? Type another prompt or 'quit' to exit.")
-            
-        except KeyboardInterrupt:
-            print("\n\n👋 Thanks for using your SLM! Happy storytelling!")
-            break
-        except Exception as e:
-            print(f"\n❌ Error: {e}")
-            print("Please try again or type 'quit' to exit.")
+    # Save to file if requested
+    if args.output:
+        with open(args.output, 'w', encoding='utf-8') as f:
+            f.write(f"Prompt: {args.prompt}\n")
+            f.write(f"Length: {args.length}\n")
+            f.write(f"Temperature: {args.temperature}\n")
+            f.write("-" * 60 + "\n")
+            f.write(story)
+        print(f"\n💾 Story saved to: {args.output}")
 
 if __name__ == "__main__":
-    interactive_chat()
-
-
+    main()
